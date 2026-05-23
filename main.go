@@ -16,7 +16,7 @@ import (
 
 func main() {
 	targetURL := flag.String("url", "", "Target URL (required)")
-	maxConcurrency := flag.Int("max-concurrency", 20, "Peak concurrent goroutines")
+	maxConcurrency := flag.Int("max-concurrency", 5, "Peak concurrent goroutines")
 	probeCount := flag.Int("probe-count", 5, "Sequential requests in probe phase")
 	probeInterval := flag.Duration("probe-interval", 2*time.Second, "Delay between probe requests")
 	rampSteps := flag.Int("ramp-steps", 5, "Number of concurrency increments during ramp")
@@ -30,6 +30,7 @@ func main() {
 	customUA := flag.String("user-agent", "", "Override User-Agent string (disables branding)")
 	slowThreshold := flag.Float64("slow-threshold", 3.0, "Response times exceeding this multiple of baseline are unacceptable")
 	slowMin := flag.Duration("slow-min", 50*time.Millisecond, "Minimum absolute threshold for unacceptable responses")
+	tarpitThreshold := flag.Float64("tarpit-threshold", 0, "Enable tarpit detection: response times exceeding this multiple of baseline indicate CDN throttling (0=disabled)")
 	lanehogCount := flag.Int("lanehog-count", -1, "Number of lanehog workers (-1=auto 25%, 0=disabled)")
 	lanehogModeFlag := flag.String("lanehog-mode", "get", "Lanehog mode: get (persistent GET loop) or post (slow POST body)")
 	lanehogBodySize := flag.Int("lanehog-body-size", defaultLanehogBodySize, "POST body size in bytes (post mode only)")
@@ -88,6 +89,9 @@ func main() {
 	fmt.Printf("  Backoff:          %d consecutive → %s cooldown\n", *backoffThreshold, *backoffCooldown)
 	fmt.Printf("  User-Agent:       %s\n", uaLabel(resolvedUA, useRotate))
 	fmt.Printf("  Slow threshold:  %.1fx baseline (min %s)\n", *slowThreshold, *slowMin)
+	if *tarpitThreshold > 0 {
+		fmt.Printf("  Tarpit detect:  %.1fx baseline\n", *tarpitThreshold)
+	}
 	if lhCount > 0 {
 		modeStr := "GET loop"
 		if lhMode == lanehogPOST {
@@ -141,7 +145,7 @@ func main() {
 	}()
 
 	// Phase 1: Probe
-	baseline := probe(client, *targetURL, resolvedUA, useRotate, *probeCount, *probeInterval, s)
+	baseline := probe(ctx, client, *targetURL, resolvedUA, useRotate, *probeCount, *probeInterval, s)
 	if ctx.Err() != nil {
 		s.report(baseline, *slowThreshold, *slowMin, lhCount)
 		return
@@ -217,7 +221,7 @@ func main() {
 				defer wg.Done()
 				defer s.decConc()
 				worker(ctx, client, *targetURL, resolvedUA, useRotate, rampEnd, totalEnd,
-					*backoffThreshold, *backoffCooldown, s, baseline, workerID)
+					*backoffThreshold, *backoffCooldown, *tarpitThreshold, s, baseline, workerID)
 			}(step*concPerStep + i)
 
 			if baseline > 0 {
@@ -258,7 +262,7 @@ func main() {
 
 func worker(ctx context.Context, client *http.Client, url string, customUA string, rotateUA bool,
 	rampEnd, totalEnd time.Time, backoffThreshold int, backoffCooldown time.Duration,
-	s *stats, baseline time.Duration, workerID int) {
+	tarpitMultiplier float64, s *stats, baseline time.Duration, workerID int) {
 
 	consecutiveFails := 0
 	lastPhase := "ramp"
@@ -271,9 +275,26 @@ func worker(ctx context.Context, client *http.Client, url string, customUA strin
 		}
 
 		ua := pickUA(customUA, rotateUA)
+
+		// Compute tarpit deadline: if response exceeds this, cancel early
+		var tarpitDeadline time.Time
+		if tarpitMultiplier > 0 && baseline > 0 {
+			tarpitDeadline = time.Now().Add(time.Duration(float64(baseline) * tarpitMultiplier))
+		}
+
 		start := time.Now()
-		status := doRequest(client, url, ua)
+		res := doRequest(ctx, client, url, ua, tarpitDeadline)
 		dur := time.Since(start)
+
+		isTarpit := res.isTarpit
+
+		// Also detect tarpit on slow successful responses
+		if !isTarpit && tarpitMultiplier > 0 && baseline > 0 && res.status >= 200 && res.status < 400 {
+			tarpitThreshold := time.Duration(float64(baseline) * tarpitMultiplier)
+			if dur > tarpitThreshold {
+				isTarpit = true
+			}
+		}
 
 		minDelay := 50 * time.Millisecond
 		if baseline > 0 {
@@ -283,7 +304,7 @@ func worker(ctx context.Context, client *http.Client, url string, customUA strin
 			}
 		}
 		if dur < minDelay {
-			time.Sleep(minDelay - dur)
+			contextSleep(ctx, minDelay-dur)
 		}
 
 		phase := "ramp"
@@ -294,28 +315,38 @@ func worker(ctx context.Context, client *http.Client, url string, customUA strin
 			consecutiveFails = 0
 			lastPhase = phase
 		}
-		s.record(dur, status, phase)
+		s.record(dur, res.status, phase, isTarpit)
 
-		if s.is5xxOrTimeout(status) {
+		if isTarpit {
+			fmt.Printf("  [%s] w%02d  TARPIT  %6.3fs  (>%0.0fx baseline, backing off 30s)\n",
+				phase, workerID, dur.Seconds(), tarpitMultiplier)
+			consecutiveFails = 0
+			contextSleep(ctx, 30*time.Second)
+			jitter := time.Duration(workerID%5) * 200 * time.Millisecond
+			contextSleep(ctx, jitter)
+			continue
+		}
+
+		if s.is5xxOrTimeout(res.status) {
 			consecutiveFails++
 
 			if phase == "sustain" && consecutiveFails >= backoffThreshold {
 				s.backoffEvts.Add(1)
 				fmt.Printf("  [SUSTAIN] w%02d  BACKOFF (consecutive=%d, cooling %s)\n",
 					workerID, consecutiveFails, backoffCooldown)
-				time.Sleep(backoffCooldown)
+				contextSleep(ctx, backoffCooldown)
 				jitter := time.Duration(workerID%5) * 100 * time.Millisecond
-				time.Sleep(jitter)
+				contextSleep(ctx, jitter)
 				consecutiveFails = 0
 				continue
 			}
 
 			if phase == "ramp" {
 				fmt.Printf("  [RAMP] w%02d  %6.3fs  status=%3d  (failure)\n",
-					workerID, dur.Seconds(), status)
+					workerID, dur.Seconds(), res.status)
 			} else {
 				fmt.Printf("  [SUSTAIN] w%02d  %6.3fs  status=%3d  consecutive_fails=%d\n",
-					workerID, dur.Seconds(), status, consecutiveFails)
+					workerID, dur.Seconds(), res.status, consecutiveFails)
 			}
 		} else {
 			if consecutiveFails > 0 {
@@ -327,18 +358,41 @@ func worker(ctx context.Context, client *http.Client, url string, customUA strin
 	}
 }
 
-func doRequest(client *http.Client, url string, ua string) int {
-	req, err := http.NewRequest("GET", url, nil)
+type requestResult struct {
+	status   int
+	isTarpit bool
+}
+
+func doRequest(ctx context.Context, client *http.Client, url string, ua string, tarpitDeadline time.Time) requestResult {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return 0
+		return requestResult{status: 0}
 	}
 	req.Header.Set("User-Agent", ua)
+
+	// If we exceed the tarpit deadline, cancel the request early
+	if !tarpitDeadline.IsZero() && time.Now().After(tarpitDeadline) {
+		return requestResult{status: 0, isTarpit: true}
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0
+		// Check if this was a tarpit cancellation (deadline exceeded during request)
+		if !tarpitDeadline.IsZero() && time.Now().After(tarpitDeadline) {
+			return requestResult{status: 0, isTarpit: true}
+		}
+		return requestResult{status: 0}
 	}
 	resp.Body.Close()
-	return resp.StatusCode
+	return requestResult{status: resp.StatusCode}
+}
+
+// contextSleep sleeps for the given duration but returns early if ctx is cancelled.
+func contextSleep(ctx context.Context, d time.Duration) {
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+	}
 }
 
 func pickUA(resolvedUA string, rotate bool) string {

@@ -11,8 +11,9 @@ import (
 type result struct {
 	ts       time.Time
 	duration time.Duration
-	status   int // 0 = timeout/error, otherwise HTTP status
+	status   int  // 0 = timeout/error, otherwise HTTP status
 	phase    string
+	isTarpit bool
 }
 
 type stats struct {
@@ -22,6 +23,7 @@ type stats struct {
 	successReqs atomic.Int64
 	failReqs    atomic.Int64
 	backoffEvts atomic.Int64
+	tarpitReqs  atomic.Int64
 	curConc     atomic.Int32
 	peakConc    atomic.Int32
 }
@@ -41,13 +43,15 @@ func (s *stats) decConc() {
 	s.curConc.Add(-1)
 }
 
-func (s *stats) record(d time.Duration, status int, phase string) {
-	r := result{ts: time.Now(), duration: d, status: status, phase: phase}
+func (s *stats) record(d time.Duration, status int, phase string, isTarpit bool) {
+	r := result{ts: time.Now(), duration: d, status: status, phase: phase, isTarpit: isTarpit}
 	s.mu.Lock()
 	s.results = append(s.results, r)
 	s.mu.Unlock()
 	s.totalReqs.Add(1)
-	if status >= 200 && status < 400 {
+	if isTarpit {
+		s.tarpitReqs.Add(1)
+	} else if status >= 200 && status < 400 {
 		s.successReqs.Add(1)
 	} else {
 		s.failReqs.Add(1)
@@ -86,6 +90,7 @@ func (s *stats) report(baseline time.Duration, slowMultiplier float64, slowMin t
 	total := s.totalReqs.Load()
 	fail := s.failReqs.Load()
 	backoff := s.backoffEvts.Load()
+	tarpit := s.tarpitReqs.Load()
 	peakConc := s.peakConc.Load()
 
 	// Count acceptable vs unacceptable in sustain phase only
@@ -97,6 +102,9 @@ func (s *stats) report(baseline time.Duration, slowMultiplier float64, slowMin t
 	var acceptable, unacceptable, sustainTotal int
 	for _, r := range res {
 		if r.phase != "sustain" {
+			continue
+		}
+		if r.isTarpit {
 			continue
 		}
 		sustainTotal++
@@ -120,6 +128,9 @@ func (s *stats) report(baseline time.Duration, slowMultiplier float64, slowMin t
 	fmt.Printf("  Unacceptable:     %d/%d  (%.1f%%)\n", unacceptable, sustainTotal, 100-acceptablePct)
 	fmt.Printf("  HTTP failures:    %d\n", fail)
 	fmt.Printf("  Backoff events:   %d\n", backoff)
+	if tarpit > 0 {
+		fmt.Printf("  Tarpit responses: %d  (excluded from stats, CDN throttling detected)\n", tarpit)
+	}
 	fmt.Printf("  Peak concurrency: %d\n", peakConc)
 	if lanehogCount > 0 {
 		fmt.Printf("  Lanehog workers:  %d  (not counted in stats)\n", lanehogCount)
@@ -136,6 +147,9 @@ func (s *stats) report(baseline time.Duration, slowMultiplier float64, slowMin t
 				continue
 			}
 			durations = append(durations, r.duration)
+			if r.isTarpit {
+				continue
+			}
 			if r.status >= 200 && r.status < 400 {
 				phaseOk++
 			} else {

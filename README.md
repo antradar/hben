@@ -54,6 +54,8 @@ The final report classifies **sustain-phase** responses as acceptable or unaccep
 
 Lanehog workers occupy upstream connections (PHP-FPM, Apache workers, etc.) without contributing to stats. Their impact shows indirectly — regular workers slow down because fewer server resources are available.
 
+Servers that can't drain their worker queues quickly exhibit **tail amplification** — they continue struggling long after the traffic stops because backlogged requests are still being processed. Apache + mod_php is especially susceptible: each worker is a PHP process embedded in Apache, so occupied workers can't be recycled until Apache reaps them. nginx + PHP-FPM handles this better since FPM manages its own pool and can recycle workers per-request. Lanehog is designed to expose exactly this kind of structural weakness.
+
 Two modes:
 
 - **GET** (default) — Sends repeated GET requests. Effective against servers where each request ties up an upstream process (e.g., Apache + mod_php).

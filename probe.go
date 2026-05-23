@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -8,27 +9,36 @@ import (
 
 // probe sends sequential requests to measure baseline response time.
 // Returns the p50 duration used to pace the ramp phase.
-func probe(client *http.Client, url string, customUA string, rotateUA bool, count int, interval time.Duration, s *stats) time.Duration {
+func probe(ctx context.Context, client *http.Client, url string, customUA string, rotateUA bool, count int, interval time.Duration, s *stats) time.Duration {
 	fmt.Printf("\n[PROBE] Sending %d sequential requests (interval %s)...\n", count, interval)
 
 	var durations []time.Duration
 	for i := 0; i < count; i++ {
+		select {
+		case <-ctx.Done():
+			return p50(durations)
+		default:
+		}
 		ua := pickUA(customUA, rotateUA)
 		start := time.Now()
-		status := doRequest(client, url, ua)
+		res := doRequest(ctx, client, url, ua, time.Time{})
 		dur := time.Since(start)
-		s.record(dur, status, "probe")
+		s.record(dur, res.status, "probe", false)
 		durations = append(durations, dur)
 
 		mark := "ok"
-		if status >= 500 || status == 0 {
-			mark = fmt.Sprintf("FAIL(%d)", status)
+		if res.status >= 500 || res.status == 0 {
+			mark = fmt.Sprintf("FAIL(%d)", res.status)
 		}
 		fmt.Printf("  [%d/%d] %6.3fs  status=%3d  ua=%s  %s\n",
-			i+1, count, dur.Seconds(), status, shortUA(ua), mark)
+			i+1, count, dur.Seconds(), res.status, shortUA(ua), mark)
 
 		if i < count-1 {
-			time.Sleep(interval)
+			select {
+			case <-time.After(interval):
+			case <-ctx.Done():
+				return p50(durations)
+			}
 		}
 	}
 

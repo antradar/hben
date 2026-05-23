@@ -36,7 +36,7 @@ go install github.com/antradar/hben@latest
 hben -url https://example.com/
 ```
 
-This runs 5 probe requests, ramps to 20 concurrent workers over 10 seconds, then sustains peak load for 30 seconds. Lanehog workers are enabled by default (25% of max concurrency).
+This runs 5 probe requests, ramps to 5 concurrent workers over 10 seconds, then sustains peak load for 30 seconds. Lanehog workers are enabled by default (25% of max concurrency).
 
 ## How it works
 
@@ -87,12 +87,36 @@ hben -url https://example.com/ -lanehog-mode post
 hben -url https://example.com/ -lanehog-count 0
 ```
 
+## Testing behind a CDN
+
+CDN services like Cloudflare and Bunny.net sit in front of the origin server. To benchmark the server itself — not the CDN — add the origin's IP address to your hosts file:
+
+```bash
+# /etc/hosts
+1.2.3.4  yourdomain.com
+```
+
+As an authorized owner of the target, you know the real IP address. This bypasses the CDN entirely and gives you a direct measurement of your server's capacity.
+
+## Tarpit detection
+
+CDN and WAF services can detect automated traffic and respond by deliberately delaying responses instead of blocking them — a tactic called tarpitting. The request still succeeds (HTTP 200) but takes far longer than the server's actual capacity would explain. This skews benchmark results by inflating response times with CDN-imposed delays that have nothing to do with server performance.
+
+hben's tarpit detection (disabled by default, enable with `-tarpit-threshold`) identifies responses that exceed a multiple of the baseline — typically 10x — and classifies them as CDN throttling rather than server slowness. When detected, the worker backs off for 30 seconds to let the CDN's rate limit counter decay, and the response is excluded from the acceptable/unacceptable stats.
+
+Tarpit detection is primarily intended for identifying misuse of the tool itself — if someone runs hben without authorization, the CDN's tarpit defense will be triggered and the results will clearly show it.
+
+```bash
+# Enable tarpit detection (responses >10x baseline)
+hben -url https://example.com/ -tarpit-threshold 10
+```
+
 ## Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-url` | *(required)* | Target URL |
-| `-max-concurrency` | 20 | Peak concurrent goroutines |
+| `-max-concurrency` | 5 | Peak concurrent goroutines |
 | `-probe-count` | 5 | Sequential requests in probe phase |
 | `-probe-interval` | 2s | Delay between probe requests |
 | `-ramp-steps` | 5 | Number of concurrency increments during ramp |
@@ -103,6 +127,7 @@ hben -url https://example.com/ -lanehog-count 0
 | `-backoff-cooldown` | 2s | Pause duration when backoff triggered |
 | `-slow-threshold` | 3.0 | Multiplier of baseline for unacceptable responses |
 | `-slow-min` | 50ms | Minimum absolute threshold for unacceptable responses |
+| `-tarpit-threshold` | 0 | Enable tarpit detection: multiplier of baseline (0=disabled) |
 | `-lanehog-count` | -1 | Lanehog workers (-1=auto 25%, 0=disabled) |
 | `-lanehog-mode` | get | Lanehog mode: `get` or `post` |
 | `-lanehog-body-size` | 2048 | POST body size in bytes |
@@ -124,13 +149,15 @@ hben -url https://example.com/ -lanehog-count 0
   Unacceptable:     15/300  (5.0%)
   HTTP failures:    12
   Backoff events:   2
-  Peak concurrency: 20
+  Tarpit responses: 8  (excluded from stats, CDN throttling detected)
+  Peak concurrency: 5
   Lanehog workers:  5  (not counted in stats)
 ```
 
 - **Acceptable/Unacceptable** — Counted during sustain phase only. A response is unacceptable if it exceeds the threshold (`max(baseline × slow-threshold, slow-min)`).
 - **HTTP failures** — Responses with status codes outside 200–399.
 - **Backoff events** — Times a worker paused after hitting the consecutive failure threshold.
+- **Tarpit responses** — Responses exceeding the tarpit threshold, excluded from acceptable/unacceptable counts. Indicates CDN-level throttling, not server capacity.
 - **Lanehog workers** — Not counted in stats. Their effect is implicit in the regular workers' response times.
 
 Each phase (probe, ramp, sustain) shows its own p50/p95/p99/max latencies and acceptable percentage.

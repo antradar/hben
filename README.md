@@ -22,13 +22,6 @@ sudo apt-get update
 sudo apt-get install hben
 ```
 
-**Homebrew** (macOS/Linux):
-
-```bash
-brew tap antradar/hben
-brew install hben
-```
-
 **Go install**:
 
 ```bash

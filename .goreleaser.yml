@@ -38,16 +38,6 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
-brews:
-  - name: hben
-    homepage: https://github.com/antradar/hben
-    description: "HTTP benchmark with lanehog mode for server capacity testing"
-    repository:
-      owner: antradar
-      name: homebrew-hben
-      branch: main
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-
 changelog:
   sort: asc
   filters:

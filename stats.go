@@ -100,7 +100,7 @@ func (s *stats) report(baseline time.Duration, slowMultiplier float64, slowMin t
 			continue
 		}
 		sustainTotal++
-		if r.duration <= slowThreshold {
+		if r.status >= 200 && r.status < 400 && r.duration <= slowThreshold {
 			acceptable++
 		} else {
 			unacceptable++
@@ -142,7 +142,7 @@ func (s *stats) report(baseline time.Duration, slowMultiplier float64, slowMin t
 				phaseFail++
 				statusDist[r.status]++
 			}
-			if r.duration <= slowThreshold {
+			if r.status >= 200 && r.status < 400 && r.duration <= slowThreshold {
 				phaseAccept++
 			} else {
 				phaseUnaccept++

@@ -31,6 +31,8 @@ func main() {
 	slowThreshold := flag.Float64("slow-threshold", 3.0, "Response times exceeding this multiple of baseline are unacceptable")
 	slowMin := flag.Duration("slow-min", 50*time.Millisecond, "Minimum absolute threshold for unacceptable responses")
 	tarpitThreshold := flag.Float64("tarpit-threshold", 0, "Enable tarpit detection: response times exceeding this multiple of baseline indicate CDN throttling (0=disabled)")
+	auctionMin := flag.Duration("auction-min", -1*time.Millisecond, "Minimum baseline response time to start auction mode (-1=disabled)")
+	auctionMax := flag.Int("auction-max", 128, "Maximum concurrent workers in auction mode")
 	lanehogCount := flag.Int("lanehog-count", -1, "Number of lanehog workers (-1=auto 25%, 0=disabled)")
 	lanehogModeFlag := flag.String("lanehog-mode", "get", "Lanehog mode: get (persistent GET loop) or post (slow POST body)")
 	lanehogBodySize := flag.Int("lanehog-body-size", defaultLanehogBodySize, "POST body size in bytes (post mode only)")
@@ -42,6 +44,11 @@ func main() {
 	if *targetURL == "" {
 		fmt.Fprintln(os.Stderr, "Error: -url is required")
 		flag.Usage()
+		os.Exit(1)
+	}
+
+	if *sustainDuration < 0 && *auctionMin < 0 {
+		fmt.Fprintln(os.Stderr, "Error: -sustain-duration <0 is only valid in auction mode")
 		os.Exit(1)
 	}
 
@@ -89,6 +96,9 @@ func main() {
 	fmt.Printf("  Backoff:          %d consecutive → %s cooldown\n", *backoffThreshold, *backoffCooldown)
 	fmt.Printf("  User-Agent:       %s\n", uaLabel(resolvedUA, useRotate))
 	fmt.Printf("  Slow threshold:  %.1fx baseline (min %s)\n", *slowThreshold, *slowMin)
+	if *auctionMin >= 0 {
+		fmt.Printf("  Auction:         min %s, max %d workers\n", *auctionMin, *auctionMax)
+	}
 	if *tarpitThreshold > 0 {
 		fmt.Printf("  Tarpit detect:  %.1fx baseline\n", *tarpitThreshold)
 	}
@@ -147,7 +157,7 @@ func main() {
 	// Phase 1: Probe
 	baseline := probe(ctx, client, *targetURL, resolvedUA, useRotate, *probeCount, *probeInterval, s)
 	if ctx.Err() != nil {
-		s.report(baseline, *slowThreshold, *slowMin, lhCount)
+		s.report(*targetURL, baseline, *slowThreshold, *slowMin, lhCount)
 		return
 	}
 
@@ -165,7 +175,7 @@ func main() {
 		}
 	}
 
-	// Spawn lanehog workers before ramp
+	// Spawn lanehog workers
 	var lhWg sync.WaitGroup
 	if lhCount > 0 {
 		modeStr := "GET"
@@ -187,7 +197,171 @@ func main() {
 		}
 	}
 
-	// Phase 2+3: Ramp then sustain with same workers
+	// Auction mode: replace probe/ramp/sustain with escalating concurrency
+	if *auctionMin >= 0 {
+		fmt.Printf("\n[AUCTION] Baseline p50: %.3fs (threshold: %s)\n", baseline.Seconds(), *auctionMin)
+		if baseline < *auctionMin {
+			fmt.Printf("[AUCTION] Baseline %.3fs is below %s threshold — server is fast, no need to escalate. Done.\n",
+				baseline.Seconds(), *auctionMin)
+			cancel()
+			lhWg.Wait()
+			s.report(*targetURL, baseline, *slowThreshold, *slowMin, lhCount)
+			return
+		}
+
+		concurrency := 2
+		hitCeiling := false
+		for concurrency <= *auctionMax {
+			fmt.Printf("[AUCTION] %d concurrent workers...\n", concurrency)
+
+			var wg sync.WaitGroup
+			snapshot := &stats{}
+			for i := 0; i < concurrency; i++ {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					ua := pickUA(resolvedUA, useRotate)
+					var tarpitDeadline time.Time
+					if *tarpitThreshold > 0 && baseline > 0 {
+						tarpitDeadline = time.Now().Add(time.Duration(float64(baseline) * *tarpitThreshold))
+					}
+					start := time.Now()
+					res := doRequest(ctx, client, *targetURL, ua, tarpitDeadline)
+					dur := time.Since(start)
+					s.record(dur, res.status, "auction", res.isTarpit)
+					snapshot.record(dur, res.status, "auction", res.isTarpit)
+				}(i)
+			}
+			wg.Wait()
+
+			if ctx.Err() != nil {
+				cancel()
+				lhWg.Wait()
+				s.report(*targetURL, baseline, *slowThreshold, *slowMin, lhCount)
+				return
+			}
+
+			// Evaluate: unacceptable responses?
+			slowThresholdDur := time.Duration(float64(baseline) * *slowThreshold)
+			if slowThresholdDur < *slowMin {
+				slowThresholdDur = *slowMin
+			}
+			var unacceptable, total int
+			for _, r := range snapshot.results {
+				if r.isTarpit {
+					continue
+				}
+				total++
+				if r.status < 200 || r.status >= 400 || r.duration > slowThresholdDur {
+					unacceptable++
+				}
+			}
+			p50 := p50(snapshot.durations())
+			fmt.Printf("[AUCTION] %d workers: p50=%.3fs  unacceptable=%d/%d\n",
+				concurrency, p50.Seconds(), unacceptable, total)
+
+			unacceptablePct := 0.0
+			if total > 0 {
+				unacceptablePct = float64(unacceptable) / float64(total) * 100
+			}
+
+			if unacceptable > 0 && (unacceptablePct >= 30 || unacceptable >= 3) {
+				fmt.Printf("[AUCTION] Found capacity limit at %d workers (%.0f%% unacceptable)\n", concurrency, unacceptablePct)
+				break
+			}
+
+			if concurrency*2 > *auctionMax {
+				concurrency = *auctionMax
+				hitCeiling = true
+			} else {
+				concurrency *= 2
+			}
+		}
+
+		if hitCeiling {
+			fmt.Printf("[AUCTION] Reached ceiling of %d workers — server may handle more. Increase -auction-max to find the true limit.\n", *auctionMax)
+		}
+
+		// Sustain at the discovered concurrency
+		if *sustainDuration < 0 {
+			// Auction-only: quit after discovering the limit
+			cancel()
+			lhWg.Wait()
+			s.report(*targetURL, baseline, *slowThreshold, *slowMin, lhCount)
+			return
+		}
+
+		sustainEnd := time.Now().Add(*sustainDuration)
+		fmt.Printf("\n[SUSTAIN] %d workers for %s\n", concurrency, *sustainDuration)
+
+		var wg sync.WaitGroup
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			s.incConc()
+			go func(workerID int) {
+				defer wg.Done()
+				defer s.decConc()
+				for time.Now().Before(sustainEnd) {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+					ua := pickUA(resolvedUA, useRotate)
+					var tarpitDeadline time.Time
+					if *tarpitThreshold > 0 && baseline > 0 {
+						tarpitDeadline = time.Now().Add(time.Duration(float64(baseline) * *tarpitThreshold))
+					}
+					start := time.Now()
+					res := doRequest(ctx, client, *targetURL, ua, tarpitDeadline)
+					dur := time.Since(start)
+
+					isTarpit := res.isTarpit
+					if !isTarpit && *tarpitThreshold > 0 && baseline > 0 && res.status >= 200 && res.status < 400 {
+						tarpitThresholdDur := time.Duration(float64(baseline) * *tarpitThreshold)
+						if dur > tarpitThresholdDur {
+							isTarpit = true
+						}
+					}
+
+					s.record(dur, res.status, "sustain", isTarpit)
+
+					if isTarpit {
+						fmt.Printf("  [SUSTAIN] w%02d  TARPIT  %6.3fs  (>%0.0fx baseline, backing off 30s)\n",
+							workerID, dur.Seconds(), *tarpitThreshold)
+						contextSleep(ctx, 30*time.Second)
+						contextSleep(ctx, time.Duration(workerID%5)*200*time.Millisecond)
+						continue
+					}
+
+					minDelay := 50 * time.Millisecond
+					if baseline > 0 {
+						candidate := baseline / 4
+						if candidate > minDelay {
+							minDelay = candidate
+						}
+					}
+					if dur < minDelay {
+						contextSleep(ctx, minDelay-dur)
+					}
+
+					if s.is5xxOrTimeout(res.status) {
+						fmt.Printf("  [SUSTAIN] w%02d  %6.3fs  status=%3d\n",
+							workerID, dur.Seconds(), res.status)
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		// Auction path: report and exit
+		cancel()
+		lhWg.Wait()
+		s.report(*targetURL, baseline, *slowThreshold, *slowMin, lhCount)
+		return
+	}
+
+	// Non-auction path: Phase 2+3: Ramp then sustain
 	rampEnd := time.Now().Add(*rampDuration)
 	totalEnd := time.Now().Add(*rampDuration + *sustainDuration)
 
@@ -242,7 +416,7 @@ func main() {
 				wg.Wait()
 				cancel() // kill lanehog workers too
 				lhWg.Wait()
-				s.report(baseline, *slowThreshold, *slowMin, lhCount)
+				s.report(*targetURL, baseline, *slowThreshold, *slowMin, lhCount)
 				return
 			case <-time.After(stepDur):
 			}
@@ -257,7 +431,7 @@ func main() {
 	// Cancel context to kill lanehog workers (even mid-request)
 	cancel()
 	lhWg.Wait()
-	s.report(baseline, *slowThreshold, *slowMin, lhCount)
+	s.report(*targetURL, baseline, *slowThreshold, *slowMin, lhCount)
 }
 
 func worker(ctx context.Context, client *http.Client, url string, customUA string, rotateUA bool,

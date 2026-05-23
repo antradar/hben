@@ -9,6 +9,7 @@ hben exposes chokepoints in multi-tiered web apps by sending adapted request pat
 - **High concurrency from a single sender** — hundreds of goroutines from one machine
 - **Adaptive backoff** — detects failures and steps back to sustain pressure rather than flooding a downed server
 - **Acceptable/unacceptable classification** — responses during sustain are measured against a baseline, giving you a human-readable pass/fail percentage instead of raw latency numbers
+- **Auction mode** — automatically finds the server's capacity limit by doubling workers until unacceptable responses appear
 - **Lanehog mode** — occupies upstream connections (PHP-FPM, Apache workers) with minimal bandwidth, using best-effort techniques to bypass nginx buffering and reach non-scalable backends directly
 
 ## Install
@@ -40,7 +41,7 @@ This runs 5 probe requests, ramps to 5 concurrent workers over 10 seconds, then 
 
 ## How it works
 
-hben runs in three phases:
+By default, hben runs in three phases:
 
 1. **Probe** — Sends sequential requests to establish a baseline response time
 2. **Ramp** — Gradually increases concurrency from 1 to the target, stepping up at intervals
@@ -49,6 +50,26 @@ hben runs in three phases:
 Workers that hit `backoff-threshold` consecutive 5xx/timeout responses pause for `backoff-cooldown` before resuming. This avoids flooding a downed server and instead sustains measurable pressure — which is more revealing than a flat flood that just gets 500s back.
 
 The final report classifies **sustain-phase** responses as acceptable or unacceptable. A response is unacceptable if it exceeds `max(baseline × slow-threshold, slow-min)`. The goal is 100% acceptable during sustain.
+
+## Auction mode
+
+Instead of manually picking a concurrency level, auction mode automatically finds the server's capacity limit by doubling workers until unacceptable responses appear.
+
+1. Sends a single probe request to get the baseline
+2. If baseline < `auction-min`, the server is fast enough — no need to escalate
+3. Starts with 2 workers, each sending one request
+4. If no unacceptable responses: double the workers
+5. Repeats until unacceptable responses appear or `auction-max` is reached
+
+```bash
+# Find capacity limit: escalate from 2 workers, minimum baseline 100ms
+hben -url https://example.com/ -auction-min 100ms
+
+# Cap at 64 workers
+hben -url https://example.com/ -auction-min 100ms -auction-max 64
+```
+
+When auction mode is active, probe/ramp/sustain phases are skipped — the auction IS the benchmark.
 
 ## Lanehog
 
@@ -128,6 +149,8 @@ hben -url https://example.com/ -tarpit-threshold 10
 | `-slow-threshold` | 3.0 | Multiplier of baseline for unacceptable responses |
 | `-slow-min` | 50ms | Minimum absolute threshold for unacceptable responses |
 | `-tarpit-threshold` | 0 | Enable tarpit detection: multiplier of baseline (0=disabled) |
+| `-auction-min` | -1 | Minimum baseline response time to start auction mode (-1=disabled) |
+| `-auction-max` | 128 | Maximum concurrent workers in auction mode |
 | `-lanehog-count` | -1 | Lanehog workers (-1=auto 25%, 0=disabled) |
 | `-lanehog-mode` | get | Lanehog mode: `get` or `post` |
 | `-lanehog-body-size` | 2048 | POST body size in bytes |

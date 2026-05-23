@@ -62,6 +62,16 @@ func (s *stats) is5xxOrTimeout(status int) bool {
 	return status >= 500 || status == 0
 }
 
+func (s *stats) durations() []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := make([]time.Duration, len(s.results))
+	for i, r := range s.results {
+		d[i] = r.duration
+	}
+	return d
+}
+
 func percentiles(durations []time.Duration) (p50, p95, p99, max time.Duration) {
 	n := len(durations)
 	if n == 0 {
@@ -81,7 +91,7 @@ func percentiles(durations []time.Duration) (p50, p95, p99, max time.Duration) {
 	return
 }
 
-func (s *stats) report(baseline time.Duration, slowMultiplier float64, slowMin time.Duration, lanehogCount int) {
+func (s *stats) report(targetURL string, baseline time.Duration, slowMultiplier float64, slowMin time.Duration, lanehogCount int) {
 	s.mu.Lock()
 	res := make([]result, len(s.results))
 	copy(res, s.results)
@@ -122,6 +132,7 @@ func (s *stats) report(baseline time.Duration, slowMultiplier float64, slowMin t
 	fmt.Println()
 	fmt.Println("═══════════════════════════════════════════════════════")
 	fmt.Println("  HBEN REPORT")
+	fmt.Printf("  Target:           %s\n", targetURL)
 	fmt.Println("═══════════════════════════════════════════════════════")
 	fmt.Printf("  Total requests:   %d\n", total)
 	fmt.Printf("  Acceptable:       %d/%d  (%.1f%%)  [threshold: %.1fx baseline = %.3fs]\n", acceptable, sustainTotal, acceptablePct, slowMultiplier, slowThreshold.Seconds())

@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.png" width="128" height="128"></p>
+
 # hben — HTTP Benchmark
 
 hben exposes chokepoints in multi-tiered web apps by sending adapted request patterns and measuring how the stack degrades under pressure. It's more app-aware than raw flood tools like `ab` or `siege` — which only tell you requests per second — and far more compact than full-blown testing suites.

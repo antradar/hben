@@ -1,0 +1,56 @@
+version: 2
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+nfpms:
+  - id: hben
+    package_name: hben
+    builds:
+      - hben
+    formats:
+      - deb
+      - rpm
+    maintainer: Antradar Software Inc.
+    description: |
+      HTTP benchmark tool with lanehog mode for server capacity testing.
+      Simulates realistic attack patterns (probe, ramp, sustain) with
+      adaptive backoff and slow-loris-style connection holding.
+    homepage: https://github.com/antradar/hben
+    license: MIT
+
+archives:
+  - format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "checksums.txt"
+
+brews:
+  - name: hben
+    homepage: https://github.com/antradar/hben
+    description: "HTTP benchmark with lanehog mode for server capacity testing"
+    repository:
+      owner: antradar
+      name: homebrew-hben
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
